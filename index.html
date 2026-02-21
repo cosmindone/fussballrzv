@@ -926,82 +926,88 @@ async function api(endpoint) {
   }
 }
 
-// ── FETCH ALL ─────────────────────────────────────────────
+// ── SLEEP HELPER ──────────────────────────────────────────
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const DELAY = 700; // ms between each request — stays well under 10/min limit
+
+// ── FETCH ALL (sequential to respect rate limits) ─────────
 async function fetchAll() {
   setStatus('loading', '● SYNCING');
   clearTimeout(refreshTimer);
   startRefreshBar();
-  diag('--- Starting data refresh ---');
+  diag('--- Starting data refresh (sequential) ---');
+
+  let anyFailed = false;
+
+  // Helper to safely call with delay
+  async function safe(label, fn) {
+    await sleep(DELAY);
+    try {
+      const result = await fn();
+      return result;
+    } catch (e) {
+      anyFailed = true;
+      diag(`${label} failed: ${e.message}`, true);
+      return null;
+    }
+  }
 
   try {
-    const [
-      liveMatches,
-      upcomingLaLiga,
-      upcomingUCL,
-      upcomingUEL,
-      standings,
-      scorers,
-      resultsLL,
-      resultsUCL,
-      resultsUEL
-    ] = await Promise.allSettled([
-      fetchLiveMatches(),
-      fetchUpcoming(COMPS.laliga, 5),
-      fetchUpcoming(COMPS.ucl, 3),
-      fetchUpcoming(COMPS.uel, 3),
-      fetchStandings(),
-      fetchScorers(),
-      fetchRecentResults(COMPS.laliga, 6),
-      fetchRecentResults(COMPS.ucl, 4),
-      fetchRecentResults(COMPS.uel, 4),
-    ]);
+    // 1. La Liga standings
+    const standingsData = await safe('Standings', fetchStandings);
+    if (standingsData) renderStandings(standingsData);
+    else document.getElementById('standings-container').innerHTML = '<div class="no-data">⚠ Failed to load standings</div>';
 
-    const live = liveMatches.status === 'fulfilled' ? liveMatches.value : [];
-    const upcoming = [
-      ...(upcomingLaLiga.status === 'fulfilled' ? upcomingLaLiga.value : []),
-      ...(upcomingUCL.status === 'fulfilled' ? upcomingUCL.value : []),
-      ...(upcomingUEL.status === 'fulfilled' ? upcomingUEL.value : []),
-    ];
+    // 2. La Liga scorers
+    const scorersData = await safe('Scorers', fetchScorers);
+    if (scorersData) renderScorers(scorersData);
+    else document.getElementById('scorers-container').innerHTML = '<div class="no-data">⚠ Failed to load scorers</div>';
+
+    // 3. La Liga upcoming matches
+    const upLL = await safe('La Liga upcoming', () => fetchUpcoming(COMPS.laliga, 5));
+
+    // 4. UCL upcoming
+    const upUCL = await safe('UCL upcoming', () => fetchUpcoming(COMPS.ucl, 3));
+
+    // 5. UEL upcoming
+    const upUEL = await safe('UEL upcoming', () => fetchUpcoming(COMPS.uel, 3));
+
+    // 6. Live matches (single call covering all comps)
+    const liveData = await safe('Live matches', fetchLiveMatches);
+
+    // Render matches
+    const live = liveData || [];
+    const upcoming = [...(upLL||[]), ...(upUCL||[]), ...(upUEL||[])];
     renderMatches(live, upcoming);
 
-    if (standings.status === 'fulfilled') {
-      renderStandings(standings.value);
-    } else {
-      diag('Standings failed: ' + standings.reason?.message, true);
-      document.getElementById('standings-container').innerHTML = '<div class="no-data">⚠ Failed to load — check diagnostics panel</div>';
-    }
+    // 7. La Liga results
+    const resLL = await safe('La Liga results', () => fetchRecentResults(COMPS.laliga, 5));
 
-    if (scorers.status === 'fulfilled') {
-      renderScorers(scorers.value);
-    } else {
-      diag('Scorers failed: ' + scorers.reason?.message, true);
-      document.getElementById('scorers-container').innerHTML = '<div class="no-data">⚠ Failed to load — check diagnostics panel</div>';
-    }
+    // 8. UCL results
+    const resUCL = await safe('UCL results', () => fetchRecentResults(COMPS.ucl, 3));
 
-    const allResults = [
-      ...(resultsLL.status === 'fulfilled' ? resultsLL.value : []),
-      ...(resultsUCL.status === 'fulfilled' ? resultsUCL.value : []),
-      ...(resultsUEL.status === 'fulfilled' ? resultsUEL.value : []),
-    ].sort((a, b) => new Date(b.utcDate) - new Date(a.utcDate));
+    // 9. UEL results
+    const resUEL = await safe('UEL results', () => fetchRecentResults(COMPS.uel, 3));
+
+    const allResults = [...(resLL||[]), ...(resUCL||[]), ...(resUEL||[])]
+      .sort((a, b) => new Date(b.utcDate) - new Date(a.utcDate));
     renderResults(allResults.slice(0, 10));
 
-    const anyFailed = [standings, scorers, resultsLL, resultsUCL, resultsUEL, upcomingLaLiga].some(r => r.status === 'rejected');
     setStatus(anyFailed ? 'err' : 'ok', anyFailed ? '● PARTIAL' : '● LIVE');
+    diag(`--- Refresh complete (${anyFailed ? 'some errors' : 'all ok'}) ---`);
+
   } catch (e) {
     setStatus('err', '● ERROR');
-    diag('Fatal fetchAll error: ' + e.message, true);
+    diag('Fatal error: ' + e.message, true);
   }
 
   refreshTimer = setTimeout(fetchAll, REFRESH_INTERVAL);
 }
 
 async function fetchLiveMatches() {
-  // Get matches that are IN_PLAY or PAUSED across our competitions
-  const queries = [COMPS.laliga, COMPS.ucl, COMPS.uel].map(c =>
-    api(`/competitions/${c}/matches?status=IN_PLAY,PAUSED`).catch(() => ({ matches: [] }))
-  );
-  const results = await Promise.all(queries);
-  return results.flatMap(r => r.matches || []);
+  // Single call covering all 3 competitions at once — saves 2 API requests
+  const data = await api(`/matches?competitions=PD,CL,EL&status=IN_PLAY,PAUSED`);
+  return data.matches || [];
 }
 
 async function fetchUpcoming(comp, limit) {
@@ -1252,4 +1258,4 @@ document.getElementById('api-key-input').addEventListener('keydown', e => {
 });
 </script>
 </body>
-</html>
+</html
